@@ -1,0 +1,140 @@
+import os
+import gradio as gr
+import numpy as np
+import faiss
+
+from groq import Groq
+from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# =====================================================
+# Configuration
+# =====================================================
+RELEVANCE_THRESHOLD = 1.2   # lower = stricter relevance
+
+# =====================================================
+# Initialize Groq Client
+# =====================================================
+client = Groq(api_key=os.environ.get("RAG-GROQ"))
+# =====================================================
+# Load Embedding Model
+# =====================================================
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+# =====================================================
+# Global Vector Store
+# =====================================================
+vector_store = None
+stored_chunks = []
+
+# =====================================================
+# PDF Processing Function
+# =====================================================
+def process_pdf(pdf_file):
+    global vector_store, stored_chunks
+
+    reader = PdfReader(pdf_file)
+    full_text = ""
+
+    for page in reader.pages:
+        if page.extract_text():
+            full_text += page.extract_text() + "\n"
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=100
+    )
+    chunks = splitter.split_text(full_text)
+
+    embeddings = embedding_model.encode(chunks)
+
+    dimension = embeddings.shape[1]
+    vector_store = faiss.IndexFlatL2(dimension)
+    vector_store.add(np.array(embeddings))
+
+    stored_chunks = chunks
+
+    return "✅ PDF processed successfully. You can now ask questions."
+
+# =====================================================
+# Question Answering Function
+# =====================================================
+def answer_question(question):
+    if vector_store is None:
+        return "⚠️ Please upload and process a PDF first."
+
+    question_embedding = embedding_model.encode([question])
+    distances, indices = vector_store.search(
+        np.array(question_embedding), k=3
+    )
+
+    avg_distance = distances[0].mean()
+
+    context = ""
+    for idx in indices[0]:
+        context += stored_chunks[idx] + "\n"
+
+    # Relevance feedback
+    if avg_distance > RELEVANCE_THRESHOLD:
+        relevance_note = (
+            "⚠️ **Note:** This question is not directly answered in the document.\n"
+            "The response below is based on loosely related context.\n\n"
+        )
+    else:
+        relevance_note = ""
+
+    prompt = f"""
+You are an honest and careful AI assistant.
+
+Instructions:
+- Answer ONLY using the provided context.
+- If the answer is not explicitly stated, say:
+  "This is not directly mentioned in the document, but based on related context..."
+
+Context:
+{context}
+
+Question:
+{question}
+"""
+
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "user", "content": prompt}
+        ]
+    )
+
+    return relevance_note + response.choices[0].message.content
+
+# =====================================================
+# Gradio UI
+# =====================================================
+with gr.Blocks() as app:
+    gr.Markdown("## 📄 RAG-based PDF Question Answering (Groq + FAISS)")
+    gr.Markdown(
+        "Upload a PDF and ask questions. "
+        "The system will clearly tell you if an answer is not directly mentioned."
+    )
+
+    pdf_file = gr.File(label="Upload PDF", file_types=[".pdf"])
+    process_btn = gr.Button("Process PDF")
+    status_box = gr.Textbox(label="Status", interactive=False)
+
+    question_box = gr.Textbox(label="Ask a Question")
+    answer_box = gr.Textbox(label="Answer", lines=8)
+
+    process_btn.click(
+        process_pdf,
+        inputs=pdf_file,
+        outputs=status_box
+    )
+
+    question_box.submit(
+        answer_question,
+        inputs=question_box,
+        outputs=answer_box
+    )
+
+app.launch()
